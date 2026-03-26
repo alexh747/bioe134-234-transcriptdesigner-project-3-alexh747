@@ -1,5 +1,3 @@
-# Code before the forbidden site and haiprin iteration modification
-
 # New Version of Transcript Designer 
 import random
 import csv
@@ -135,14 +133,14 @@ class TranscriptDesigner:
     def _initial_codons(self, peptide: str) -> list:
         """
         Generate an initial codon list using frequency-weighted random selection.
-        The first codon is always ATG (start codon) regardless of the first amino acid.
-        This naturally produces high CAI and good codon diversity because
-        common codons are selected proportionally to their usage in E. coli.
+        The first codon is ATG if the first amino acid is M; otherwise the
+        appropriate codon for the actual amino acid is used so that the CDS
+        translates back to the original protein.
         """
         codons = []
         for idx, aa in enumerate(peptide):
-            if idx == 0:
-                codons.append("ATG")  # always start with ATG
+            if idx == 0 and aa == 'M':
+                codons.append("ATG")
             else:
                 codons.append(self._weighted_random_codon(aa))
         codons.append("TAA")  # stop codon
@@ -255,7 +253,8 @@ class TranscriptDesigner:
                     codon_start = max(0, cds_start // 3)
                     codon_end = min(len(codons) - 1, cds_end // 3 + 1)
 
-                    for ci in range(codon_start, codon_end):
+                    # Swap every other codon to break stems while preserving diversity/CAI
+                    for ci in range(codon_start, codon_end, 2):
                         codons[ci] = self._alternate_codon(codons[ci])
 
                     # Re-build transcript_dna after changes for next chunk
@@ -277,7 +276,7 @@ class TranscriptDesigner:
         Algorithm:
           1. Generate an initial CDS using frequency-weighted random codon selection.
           2. Pick an RBS.
-          3. Single repair cycle: fix forbidden / promoters / hairpins.
+          3. Two repair cycles: fix forbidden / promoters / hairpins.
           4. Track the best candidate across restarts if needed.
           5. Return the best (or first perfect) result.
 
@@ -288,7 +287,7 @@ class TranscriptDesigner:
         Returns:
             Transcript: The designed transcript with RBS and codon list.
         """
-        MAX_RESTARTS = 2
+        MAX_RESTARTS = 3
 
         best_codons = None
         best_score = -1
@@ -303,39 +302,39 @@ class TranscriptDesigner:
             selectedRBS = self.rbsChooser.run(cds, ignores)
             rbs_utr = selectedRBS.utr
 
-            # Step 3: single repair cycle (no double checker calls)
+            # Step 3: two repair cycles (no double checker calls)
+            for _cycle in range(2):
+                # Fix forbidden sites
+                for _ in range(8):
+                    passed, site = self.forbiddenChecker.run(rbs_utr.upper() + ''.join(codons))
+                    if passed:
+                        break
+                    self._fix_at_site(codons, rbs_utr, site)
 
-            # Fix forbidden sites
-            for _ in range(6):
-                passed, site = self.forbiddenChecker.run(rbs_utr.upper() + ''.join(codons))
-                if passed:
-                    break
-                self._fix_at_site(codons, rbs_utr, site)
+                # Fix promoters
+                for _ in range(8):
+                    passed, seq = self.promoterChecker.run(rbs_utr.upper() + ''.join(codons))
+                    if passed:
+                        break
+                    self._fix_at_site(codons, rbs_utr, seq)
 
-            # Fix promoters
-            for _ in range(6):
-                passed, seq = self.promoterChecker.run(rbs_utr.upper() + ''.join(codons))
-                if passed:
-                    break
-                self._fix_at_site(codons, rbs_utr, seq)
+                # Hairpin sweep — only if needed
+                passed_h, _ = hairpin_checker(rbs_utr.upper() + ''.join(codons))
+                if not passed_h:
+                    codons = self._sweep_hairpins(codons, rbs_utr, max_passes=3)
 
-            # Hairpin sweep — only if needed
-            passed_h, _ = hairpin_checker(rbs_utr.upper() + ''.join(codons))
-            if not passed_h:
-                codons = self._sweep_hairpins(codons, rbs_utr, max_passes=3)
+                # Cleanup: re-fix forbidden/promoter that hairpin sweep may have introduced
+                for _ in range(5):
+                    passed, site = self.forbiddenChecker.run(rbs_utr.upper() + ''.join(codons))
+                    if passed:
+                        break
+                    self._fix_at_site(codons, rbs_utr, site)
 
-            # Cleanup: re-fix forbidden/promoter that hairpin sweep may have introduced
-            for _ in range(4):
-                passed, site = self.forbiddenChecker.run(rbs_utr.upper() + ''.join(codons))
-                if passed:
-                    break
-                self._fix_at_site(codons, rbs_utr, site)
-
-            for _ in range(4):
-                passed, seq = self.promoterChecker.run(rbs_utr.upper() + ''.join(codons))
-                if passed:
-                    break
-                self._fix_at_site(codons, rbs_utr, seq)
+                for _ in range(5):
+                    passed, seq = self.promoterChecker.run(rbs_utr.upper() + ''.join(codons))
+                    if passed:
+                        break
+                    self._fix_at_site(codons, rbs_utr, seq)
 
             # Score this candidate
             results = self._check_all(codons, rbs_utr)
