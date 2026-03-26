@@ -187,54 +187,39 @@ class TranscriptDesigner:
     # Targeted repair strategies
     # ------------------------------------------------------------------
     def _find_site_codon_range(self, codons: list, rbs_utr: str, site: str) -> tuple:
-        """Locate *site* in the transcript DNA and return the codon index range
-        (start, end) within the CDS that overlaps with it.  Returns None if not found."""
+        """Locate *site* in the transcript DNA (forward or reverse complement)
+        and return the codon index range (start, end) within the CDS that
+        overlaps with it.  Returns None if not found on either strand."""
         cds = ''.join(codons)
         transcript_dna = rbs_utr.upper() + cds
         utr_len = len(rbs_utr)
 
         pos = transcript_dna.upper().find(site.upper())
         if pos == -1:
-            return None
+            # Check reverse complement strand
+            rc = reverse_complement(transcript_dna)
+            rc_pos = rc.upper().find(site.upper())
+            if rc_pos == -1:
+                return None
+            pos = len(transcript_dna) - rc_pos - len(site)
 
         cds_start = max(0, pos - utr_len)
         cds_end = min(len(cds), cds_start + len(site) + 3)
         codon_start = max(0, cds_start // 3 - 1)
-        codon_end = min(len(codons) - 1, cds_end // 3 + 1)  # avoid stop codon
+        codon_end = min(len(codons) - 1, cds_end // 3 + 1)
         return codon_start, codon_end
 
-    def _fix_forbidden(self, codons: list, rbs_utr: str) -> list:
-        """Eliminate a forbidden site by swapping codons in the overlapping region."""
-        passed, site = self.forbiddenChecker.run(rbs_utr.upper() + ''.join(codons))
-        if passed or site is None:
-            return codons
-
+    def _fix_at_site(self, codons: list, rbs_utr: str, site: str) -> None:
+        """Swap codons overlapping a problematic site to break it.
+        Used for both forbidden sequences and internal promoters."""
+        if site is None:
+            return
         rng = self._find_site_codon_range(codons, rbs_utr, site)
         if rng is None:
-            # Site might be in reverse complement context; do a broader swap
-            self._random_swap(codons, 5)
-            return codons
-
-        start, end = rng
-        for i in range(start, end):
-            codons[i] = self._alternate_codon(codons[i])
-        return codons
-
-    def _fix_promoter(self, codons: list, rbs_utr: str) -> list:
-        """Break an internal promoter by swapping codons in the matching region."""
-        passed, found_seq = self.promoterChecker.run(rbs_utr.upper() + ''.join(codons))
-        if passed or found_seq is None:
-            return codons
-
-        rng = self._find_site_codon_range(codons, rbs_utr, found_seq)
-        if rng is None:
-            self._random_swap(codons, 5)
-            return codons
-
-        start, end = rng
-        for i in range(start, end):
-            codons[i] = self._alternate_codon(codons[i])
-        return codons
+            self._random_swap(codons, 3)
+        else:
+            for i in range(rng[0], rng[1]):
+                codons[i] = self._alternate_codon(codons[i])
 
     def _random_swap(self, codons: list, n: int) -> list:
         """Swap *n* random coding positions (not the stop codon)."""
@@ -292,8 +277,8 @@ class TranscriptDesigner:
         Algorithm:
           1. Generate an initial CDS using frequency-weighted random codon selection.
           2. Pick an RBS.
-          3. Iteratively: fix forbidden sites / promoters / hairpins; re-check.
-          4. Track the best candidate across multiple random restarts.
+          3. Single repair cycle: fix forbidden / promoters / hairpins.
+          4. Track the best candidate across restarts if needed.
           5. Return the best (or first perfect) result.
 
         Parameters:
@@ -303,7 +288,7 @@ class TranscriptDesigner:
         Returns:
             Transcript: The designed transcript with RBS and codon list.
         """
-        MAX_RESTARTS = 3
+        MAX_RESTARTS = 2
 
         best_codons = None
         best_score = -1
@@ -318,37 +303,39 @@ class TranscriptDesigner:
             selectedRBS = self.rbsChooser.run(cds, ignores)
             rbs_utr = selectedRBS.utr
 
-            # Step 3: iterative repair — two cycles of fix-all
-            for _cycle in range(2):
-                # Fix forbidden sites (check both strands)
-                for _ in range(8):
-                    passed_f, _ = self.forbiddenChecker.run(rbs_utr.upper() + ''.join(codons))
-                    if passed_f:
-                        break
-                    codons = self._fix_forbidden(codons, rbs_utr)
+            # Step 3: single repair cycle (no double checker calls)
 
-                # Fix promoters
-                for _ in range(8):
-                    passed_p, _ = self.promoterChecker.run(rbs_utr.upper() + ''.join(codons))
-                    if passed_p:
-                        break
-                    codons = self._fix_promoter(codons, rbs_utr)
+            # Fix forbidden sites
+            for _ in range(6):
+                passed, site = self.forbiddenChecker.run(rbs_utr.upper() + ''.join(codons))
+                if passed:
+                    break
+                self._fix_at_site(codons, rbs_utr, site)
 
-                # Hairpin sweep
+            # Fix promoters
+            for _ in range(6):
+                passed, seq = self.promoterChecker.run(rbs_utr.upper() + ''.join(codons))
+                if passed:
+                    break
+                self._fix_at_site(codons, rbs_utr, seq)
+
+            # Hairpin sweep — only if needed
+            passed_h, _ = hairpin_checker(rbs_utr.upper() + ''.join(codons))
+            if not passed_h:
                 codons = self._sweep_hairpins(codons, rbs_utr, max_passes=3)
 
-                # Re-fix forbidden/promoter that hairpin sweep may have introduced
-                for _ in range(5):
-                    passed_f, _ = self.forbiddenChecker.run(rbs_utr.upper() + ''.join(codons))
-                    if passed_f:
-                        break
-                    codons = self._fix_forbidden(codons, rbs_utr)
+            # Cleanup: re-fix forbidden/promoter that hairpin sweep may have introduced
+            for _ in range(4):
+                passed, site = self.forbiddenChecker.run(rbs_utr.upper() + ''.join(codons))
+                if passed:
+                    break
+                self._fix_at_site(codons, rbs_utr, site)
 
-                for _ in range(5):
-                    passed_p, _ = self.promoterChecker.run(rbs_utr.upper() + ''.join(codons))
-                    if passed_p:
-                        break
-                    codons = self._fix_promoter(codons, rbs_utr)
+            for _ in range(4):
+                passed, seq = self.promoterChecker.run(rbs_utr.upper() + ''.join(codons))
+                if passed:
+                    break
+                self._fix_at_site(codons, rbs_utr, seq)
 
             # Score this candidate
             results = self._check_all(codons, rbs_utr)
